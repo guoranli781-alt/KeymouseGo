@@ -4,6 +4,7 @@ import win32api
 
 from Event.Event import Event
 from loguru import logger
+from Util.WindowBind import BackgroundAbort, abort_for_route, dispatch_route, event_is_background
 
 import ctypes
 import win32con
@@ -34,6 +35,14 @@ class WindowsEvent(Event):
     # 执行操作
     def execute(self, thd=None):
         self.sleep(thd)
+        route = dispatch_route(
+            event_is_background(self),
+            getattr(thd, 'background_session', None) is not None)
+        if route == 'background':
+            thd.background_session.play(self)
+            return
+        if route != 'global':
+            raise BackgroundAbort(abort_for_route(route))
 
         if self.event_type == 'EM':
             x, y = self.action

@@ -13,7 +13,8 @@ import Recorder
 from PySide6.QtGui import QTextCursor
 from qt_material import list_themes, QtStyleTools
 from PySide6.QtCore import *
-from PySide6.QtWidgets import QMainWindow, QApplication, QMessageBox
+from PySide6.QtWidgets import (QMainWindow, QApplication, QMessageBox, QGroupBox,
+                             QGridLayout, QCheckBox, QComboBox, QPushButton, QLabel)
 from PySide6.QtMultimedia import QSoundEffect
 from loguru import logger
 
@@ -25,6 +26,7 @@ from KeymouseGo import to_abs_path
 from Util.RunScriptClass import RunScriptClass
 from Util.Global import State
 from Util.ClickedLabel import Label
+from Util.WindowBind import background_script_document
 
 
 os.environ['QT_ENABLE_HIGHDPI_SCALING'] = "1"
@@ -163,6 +165,7 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
         self.hotkey_stop.clicked.connect(lambda: self.OnHotkeyButton(self.hotkey_stop))
         self.hotkey_start.clicked.connect(lambda: self.OnHotkeyButton(self.hotkey_start))
         self.hotkey_record.clicked.connect(lambda: self.OnHotkeyButton(self.hotkey_record))
+        self._init_background_widgets()
 
         # 热键引发状态转移
         def check_hotkeys(key_name):
@@ -255,10 +258,23 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
                         return
             # 录制事件
             if self.state == State.RECORDING:
-                if event.event_type == 'EM' and not flag_multiplemonitor:
+                if self.background_mode and getattr(event, 'recordable', True) is False:
+                    reason = getattr(event, 'skip_reason', '')
+                    quiet = {
+                        '不在目标窗口', '前台不是目标窗口', '未绑定窗口', '没有命中窗口',
+                    }
+                    if reason and reason not in quiet and reason != getattr(self, '_last_skip_reason', None):
+                        self._last_skip_reason = reason
+                        self.textlog.append(reason)
+                    return
+                if self.background_mode and getattr(event, 'replay', None) != 'background':
+                    return
+                if event.event_type == 'EM' and not flag_multiplemonitor and not self.background_mode:
                     tx, ty = event.action
                     event.action = ['{0}%'.format(tx), '{0}%'.format(ty)]
-                event_dict = event.__dict__
+                event_dict = dict(event.__dict__)
+                event_dict.pop('recordable', None)
+                event_dict.pop('skip_reason', None)
                 event_dict['type'] = 'event'
                 # PluginManager.call_record(event_dict)
                 self.record.append(event_dict)
@@ -308,6 +324,7 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
             _app.installTranslator(self.trans)
             self.retranslateUi(self)
         self.retranslateUi(self)
+        self._apply_background_texts()
         self.hotkey_stop.setText(self.config.value("Config/StopHotKey"))
         self.hotkey_start.setText(self.config.value("Config/StartHotKey"))
         self.hotkey_record.setText(self.config.value("Config/RecordHotKey"))
@@ -413,7 +430,7 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
         if self.state == State.RECORDING or self.state == State.PAUSE_RECORDING:
             logger.info('Record stop')
             with open(self.new_script_path(), 'w', encoding='utf-8') as f:
-                json5.dump({"scripts": self.record}, indent=2, ensure_ascii=False, fp=f)
+                json5.dump(background_script_document(self.record), indent=2, ensure_ascii=False, fp=f)
             self.btrecord.setText(QCoreApplication.translate("UIView", 'Record', None))
             self.tnumrd.setText('finished')
             self.record = []
@@ -422,6 +439,9 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
             self.btpauserecord.setText(QCoreApplication.translate("UIView", 'Pause Record', None))
             self.update_state(State.IDLE)
         elif self.state == State.IDLE:
+            if self.background_mode and not self.bound_window:
+                self.textlog.append('后台模式尚未绑定窗口，不能录制')
+                return
             logger.info('Record start')
             self.textlog.clear()
             status = self.tnumrd.text()
@@ -434,7 +454,8 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
 
     def OnBtrecordButton(self):
         if self.state == State.RECORDING or self.state == State.PAUSE_RECORDING:
-            self.record = self.record[:-2]
+            if not self.background_mode:
+                self.record = self.record[:-2]
         self.recordMethod()
 
     def OnBtrunButton(self):
@@ -483,3 +504,133 @@ class UIFunc(QMainWindow, Ui_UIView, QtStyleTools):
     @Slot(tuple)
     def cursor_pos_change(self, pos):
         self.label_cursor_pos.setText(f'Cursor pos: {pos}')
+
+    def background_override_spec(self):
+        if not self.bound_window:
+            return None
+        return self.bound_window.as_spec()
+
+    def _init_background_widgets(self):
+        self.background_mode = False
+        self.bound_window = None
+        self._window_choices = []
+        self._last_skip_reason = None
+        Recorder.globals.background_mode = False
+        Recorder.globals.bound_window = None
+
+        geo = self.verticalLayoutWidget.geometry()
+        geo.setHeight(geo.height() + 96)
+        self.verticalLayoutWidget.setGeometry(geo)
+        self.resize(self.width(), self.height() + 96)
+
+        self.backgroundBox = QGroupBox(self.verticalLayoutWidget)
+        layout = QGridLayout(self.backgroundBox)
+        self.bt_background_mode = QCheckBox(self.backgroundBox)
+        self.choice_window = QComboBox(self.backgroundBox)
+        self.bt_refresh_windows = QPushButton(self.backgroundBox)
+        self.bt_bind_window = QPushButton(self.backgroundBox)
+        self.label_background_status = QLabel(self.backgroundBox)
+        self.label_background_status.setWordWrap(True)
+        layout.addWidget(self.bt_background_mode, 0, 0, 1, 2)
+        layout.addWidget(self.choice_window, 1, 0, 1, 2)
+        layout.addWidget(self.bt_refresh_windows, 2, 0)
+        layout.addWidget(self.bt_bind_window, 2, 1)
+        layout.addWidget(self.label_background_status, 3, 0, 1, 2)
+        self.verticalLayout.insertWidget(0, self.backgroundBox)
+
+        self.bt_background_mode.toggled.connect(self._on_background_toggled)
+        self.bt_refresh_windows.clicked.connect(self._refresh_windows)
+        self.bt_bind_window.clicked.connect(self._bind_selected_window)
+        windows_ok = platform.system() == 'Windows'
+        self.bt_background_mode.setEnabled(windows_ok)
+        self.bt_refresh_windows.setEnabled(windows_ok)
+        self.bt_bind_window.setEnabled(windows_ok)
+        self.choice_window.setEnabled(windows_ok)
+        self._apply_background_texts()
+
+    def _language_is_english(self):
+        return self.choice_language.currentText() == 'English'
+
+    def _apply_background_texts(self):
+        if not hasattr(self, 'backgroundBox'):
+            return
+        english = self._language_is_english()
+        traditional = self.choice_language.currentText() == '繁體中文'
+        if english:
+            self.backgroundBox.setTitle('Background window')
+            self.bt_background_mode.setText('Background replay (experimental)')
+            self.bt_refresh_windows.setText('Refresh')
+            self.bt_bind_window.setText('Bind')
+        elif traditional:
+            self.backgroundBox.setTitle('後台視窗')
+            self.bt_background_mode.setText('後台回放（實驗，不保證遊戲可用）')
+            self.bt_refresh_windows.setText('重新整理視窗')
+            self.bt_bind_window.setText('綁定所選視窗')
+        else:
+            self.backgroundBox.setTitle('后台窗口')
+            self.bt_background_mode.setText('后台回放（实验，不保证游戏可用）')
+            self.bt_refresh_windows.setText('刷新窗口')
+            self.bt_bind_window.setText('绑定所选窗口')
+        self._update_background_status()
+
+    def _update_background_status(self):
+        english = self._language_is_english()
+        if platform.system() != 'Windows':
+            text = 'Background replay is Windows-only' if english else '后台回放仅支持 Windows'
+            self.label_background_status.setText(text)
+            return
+        if not self.background_mode:
+            text = 'Mode: normal (global mouse and keyboard)' if english else '当前：普通模式（全局鼠标键盘）'
+            self.label_background_status.setText(text)
+            return
+        if not self.bound_window:
+            text = 'Mode: background, no window bound' if english else '当前：后台模式，尚未绑定窗口'
+            self.label_background_status.setText(text)
+            return
+        window = self.bound_window
+        if english:
+            text = 'Mode: background, bound to {0} [{1}]'.format(window.title, window.class_name)
+        else:
+            text = '当前：后台模式，已绑定 {0} [{1}]'.format(window.title, window.class_name)
+        self.label_background_status.setText(text)
+
+    def _on_background_toggled(self, checked):
+        self.background_mode = bool(checked)
+        Recorder.globals.background_mode = self.background_mode
+        self._last_skip_reason = None
+        if self.background_mode:
+            self._refresh_windows()
+        self._update_background_status()
+
+    def _refresh_windows(self):
+        self.choice_window.clear()
+        self._window_choices = []
+        if platform.system() != 'Windows':
+            self._update_background_status()
+            return
+        try:
+            from Util.WindowBind import get_api
+            windows = get_api().enum_top_level()
+        except Exception as exc:
+            logger.exception(exc)
+            self.label_background_status.setText('刷新窗口失败')
+            return
+        self._window_choices = windows
+        for window in windows:
+            title = window.title.replace('\n', ' ')
+            self.choice_window.addItem('{0}  |  {1}  |  {2}'.format(title, window.class_name, window.pid))
+        self._update_background_status()
+
+    def _bind_selected_window(self):
+        index = self.choice_window.currentIndex()
+        if index < 0 or index >= len(self._window_choices):
+            self.bound_window = None
+            Recorder.globals.bound_window = None
+            self.textlog.append('没有可绑定的窗口')
+            self._update_background_status()
+            return
+        self.bound_window = self._window_choices[index]
+        Recorder.globals.bound_window = self.bound_window
+        self.textlog.append('已绑定：{0} [{1}]'.format(
+            self.bound_window.title, self.bound_window.class_name))
+        self._update_background_status()

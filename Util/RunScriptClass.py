@@ -11,6 +11,7 @@ from Util.Global import State
 from Event import ScriptEvent
 from Plugin.Manager import PluginManager
 from Util.Parser import LegacyParser, ScriptParser, JsonObject
+from Util.WindowBind import BackgroundAbort, prepare_run
 
 mutex = QMutex()
 cond = QWaitCondition()
@@ -56,6 +57,12 @@ class RunScriptClass(QThread, RunScriptMeta):
         frame.updateStateSignal.connect(self.update_state, Qt.DirectConnection)
         self.statusSignal.connect(frame.handle_runscript_status)
         self.playtuneSignal.connect(frame.playtune)
+        self._abort_reason = None
+        self.background_session = None
+        self.background_requested = bool(getattr(frame, 'background_mode', False))
+        self.background_spec = None
+        if hasattr(frame, 'background_override_spec'):
+            self.background_spec = frame.background_override_spec()
 
     def sleep(self, msecs: int):
         RunScriptMeta.sleep(self, msecs)
@@ -89,6 +96,10 @@ class RunScriptClass(QThread, RunScriptMeta):
         self.playtuneSignal.emit('start.wav')
         try:
             self.run_script_from_path(self.script_path)
+        except BackgroundAbort as exc:
+            self.logSignal.emit(exc.reason)
+            self.tnumrdSignal.emit('stopped')
+            logger.info(exc.reason)
         except Exception as e:
             logger.error(e)
             self.logSignal.emit('An error occurred during execution! Please check logs!')
@@ -104,10 +115,13 @@ class RunScriptClass(QThread, RunScriptMeta):
 
             # 解析脚本，返回事件集合与扩展类对象
             logger.debug('Parse script..')
+            head_object = None
             try:
                 head_object = ScriptParser.parse(script_path)
             except Exception as e:
                 logger.warning('Failed to parse script, maybe it is using legacy grammar')
+                logger.debug(e)
+            if head_object is None:
                 try:
                     head_object = LegacyParser.parse(script_path)
                 except Exception as e:
@@ -115,6 +129,19 @@ class RunScriptClass(QThread, RunScriptMeta):
                     self.logSignal.emit('==============\nAn error occurred while parsing script')
                     self.logSignal.emit(str(e))
                     self.logSignal.emit('==============')
+            if head_object is None:
+                self.logSignal.emit('无法解析脚本，已停止')
+                self.tnumrdSignal.emit('stopped')
+                return
+            self._abort_reason = None
+            try:
+                prepare_run(self, head_object, self.background_requested,
+                            self.background_spec, lambda: self.state == State.IDLE)
+            except BackgroundAbort as exc:
+                self.logSignal.emit(exc.reason)
+                self.tnumrdSignal.emit('stopped')
+                logger.info(exc.reason)
+                return
 
             j = 0
             nointerrupt = True
@@ -126,6 +153,11 @@ class RunScriptClass(QThread, RunScriptMeta):
                     break
                 self.tnumrdSignal.emit(f'{running_text}... Looptimes [{j + 1}/{self.runtimes}]')
                 nointerrupt = nointerrupt and self.run_script_from_objects(head_object)
+                if self._abort_reason:
+                    self.logSignal.emit(self._abort_reason)
+                    self.tnumrdSignal.emit('stopped')
+                    logger.info(self._abort_reason)
+                    return
                 j += 1
             if nointerrupt:
                 self.tnumrdSignal.emit('finished')
@@ -159,6 +191,8 @@ class RunScriptClass(QThread, RunScriptMeta):
                     self.logSignal.emit(f'An error occurred while calling {attach}, please check log file')
                     self.logSignal.emit(f'调用{attach}时发生错误，请检查程序日志')
             current_object = self.run_object(current_object)
+            if self._abort_reason:
+                return False
         return True
 
     # Only return next object when 'goto' is indicated
@@ -172,11 +206,17 @@ class RunScriptClass(QThread, RunScriptMeta):
             event = ScriptEvent(json_object.content)
             self.logSignal.emit(str(event))
             logger.debug(str(event))
-            event.execute(self)
+            try:
+                event.execute(self)
+            except BackgroundAbort as exc:
+                self._abort_reason = exc.reason
+                return None
         elif object_type == 'sequence':
             self.run_script_from_objects(json_object.content['events'], json_object.content['attach'])
         elif object_type == 'if':
             result = PluginManager.call(json_object.content['judge'], json_object)
+            if self._abort_reason:
+                return None
             if result:
                 return json_object.next_object
             else:
@@ -189,6 +229,8 @@ class RunScriptClass(QThread, RunScriptMeta):
         else:
             # Not supposed to happen
             logger.error(f'Unexpected event type when running {json_object.content}')
+        if self._abort_reason:
+            return None
         return json_object.next_object
 
 
@@ -198,11 +240,16 @@ class StopFlag:
 
 
 class RunScriptCMDClass(QThread, RunScriptMeta):
-    def __init__(self, script_path: str, run_times: int, flag: StopFlag):
+    def __init__(self, script_path: str, run_times: int, flag: StopFlag,
+                 background=False, window_spec=None):
         super().__init__()
         self.script_path = script_path
         self.run_times = run_times
         self.flag = flag
+        self.background_requested = bool(background)
+        self.background_spec = window_spec
+        self._abort_reason = None
+        self.background_session = None
 
     def sleep(self, msecs: int):
         RunScriptMeta.sleep(self, msecs)
@@ -215,22 +262,44 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
         for path in script_path:
             logger.info('Script path:%s' % path)
             logger.debug('Parse script..')
+            head_object = None
             try:
                 head_object = ScriptParser.parse(path)
             except Exception as e:
                 logger.warning('Failed to parse script, maybe it is using legacy grammar')
+                logger.debug(e)
+            if head_object is None:
                 try:
                     head_object = LegacyParser.parse(path)
                 except Exception as e:
                     logger.error(e)
+            if head_object is None:
+                logger.error('无法解析脚本，已停止')
+                self.flag.value = True
+                break
+            self._abort_reason = None
+            try:
+                prepare_run(self, head_object, self.background_requested,
+                            self.background_spec, lambda: self.flag.value)
+            except BackgroundAbort as exc:
+                logger.info(exc.reason)
+                self.flag.value = True
+                break
+
             j = 0
             while j < self.run_times or self.run_times == 0:
                 logger.info('===========%d==============' % j)
                 self.run_script_from_objects(head_object)
+                if self._abort_reason:
+                    logger.info(self._abort_reason)
+                    self.flag.value = True
+                    break
                 if self.flag.value:
                     logger.info('Stop Running thread')
                     break
                 j += 1
+            if self.flag.value or self._abort_reason:
+                break
             logger.info('%s run finish' % path)
 
     @logger.catch
@@ -242,6 +311,8 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
             if attach:
                 PluginManager.call_group(attach, current_object)
             current_object = self.run_object(current_object)
+            if self._abort_reason:
+                return False
 
     @logger.catch
     def run_object(self, json_object: JsonObject):
@@ -252,11 +323,17 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
         if object_type == 'event':
             event = ScriptEvent(json_object.content)
             logger.debug(str(event))
-            event.execute(self)
+            try:
+                event.execute(self)
+            except BackgroundAbort as exc:
+                self._abort_reason = exc.reason
+                return None
         elif object_type == 'sequence':
             self.run_script_from_objects(json_object.content['events'], json_object.content['attach'])
         elif object_type == 'if':
             result = PluginManager.call(json_object.content['judge'], json_object)
+            if self._abort_reason:
+                return None
             if result:
                 return json_object.next_object
             else:
@@ -268,5 +345,7 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
         else:
             # Not supposed to happen
             logger.error(f'Unexpected event type when running {json_object.content}')
+        if self._abort_reason:
+            return None
         return json_object.next_object
 

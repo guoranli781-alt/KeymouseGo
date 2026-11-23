@@ -7,6 +7,8 @@ swapmousemap = {'mouse left down': 'mouse right down', 'mouse left up': 'mouse r
 key_combination_trigger = []
 latest_time = -1
 mouse_interval_ms = 200
+background_mode = False
+bound_window = None
 
 
 def current_ts():

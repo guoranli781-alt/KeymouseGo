@@ -55,6 +55,14 @@ class ScriptParser(Parser):
                         json_object.next_object = target_object
                     else:
                         logger.error(f'Could not find label {target_label}')
+            if head_object is not None:
+                replay = content.get('replay')
+                if replay != 'background':
+                    replay = 'global'
+                head_object.script_meta = {
+                    'replay': replay,
+                    'target': content.get('target'),
+                }
             return head_object
         except Exception as e:
             logger.error(e)
@@ -137,4 +145,6 @@ class LegacyParser(Parser):
             })
             current_object.next_object = target_object
             target_object = current_object
+        if current_object is not None:
+            current_object.script_meta = {'replay': 'global', 'target': None}
         return current_object

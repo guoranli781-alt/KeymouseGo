@@ -36,7 +36,99 @@ keyboard_event: KeyboardEvent
 #     return wrapper
 
 
-def get_mouse_event(event):
+def _emit_skipped(event_type, action_type, reason):
+    sevent = globalv.ScriptEvent({
+        'delay': 0,
+        'event_type': event_type,
+        'action_type': action_type,
+        'action': [-1, -1],
+    })
+    sevent.recordable = False
+    sevent.skip_reason = reason
+    record_signals.event_signal.emit(sevent)
+
+
+def _background_api():
+    from Util.WindowBind import get_api
+    api = getattr(globalv, 'win_api', None)
+    if api is None:
+        api = get_api()
+        globalv.win_api = api
+    return api
+
+
+def _emit_background_mouse(action_type, delay, hwnd, screen):
+    from Util.WindowBind import capture_mouse
+    sx, sy = screen if screen is not None else win32api.GetCursorPos()
+    try:
+        api = _background_api()
+        if not hwnd:
+            hwnd = api.window_from_point(sx, sy)
+        result = capture_mouse(api, globalv.bound_window, int(hwnd or 0), int(sx), int(sy), action_type)
+    except Exception as exc:
+        logger.debug(exc)
+        _emit_skipped('EM', action_type, str(exc))
+        return
+    if not result.keep:
+        _emit_skipped('EM', action_type, result.reason)
+        return
+    if globalv.latest_time < 0:
+        delay = 0
+    globalv.latest_time = globalv.current_ts()
+    payload = {
+        'delay': delay,
+        'event_type': 'EM',
+        'action_type': action_type,
+    }
+    payload.update(result.fields)
+    sevent = globalv.ScriptEvent(payload)
+    sevent.recordable = True
+    record_signals.cursor_pos_change.emit((int(sx), int(sy)))
+    record_signals.event_signal.emit(sevent)
+
+
+def _key_char(event):
+    ascii_code = getattr(event, 'Ascii', 0) or 0
+    if isinstance(ascii_code, int) and ascii_code >= 32:
+        return chr(ascii_code)
+    return ''
+
+
+def _emit_background_key(event, action_type, delay):
+    from Util.WindowBind import capture_key
+    try:
+        api = _background_api()
+        result = capture_key(
+            api,
+            globalv.bound_window,
+            api.foreground(),
+            api.focus_hwnd(),
+            action_type,
+            (event.KeyID, event.Key, event.Extended),
+            _key_char(event),
+        )
+    except Exception as exc:
+        logger.debug(exc)
+        _emit_skipped('EK', action_type, str(exc))
+        return
+    if not result.keep:
+        _emit_skipped('EK', action_type, result.reason)
+        return
+    if globalv.latest_time < 0:
+        delay = 0
+    globalv.latest_time = globalv.current_ts()
+    payload = {
+        'delay': delay,
+        'event_type': 'EK',
+        'action_type': action_type,
+    }
+    payload.update(result.fields)
+    sevent = globalv.ScriptEvent(payload)
+    sevent.recordable = True
+    record_signals.event_signal.emit(sevent)
+
+
+def get_mouse_event(event, hwnd=0, screen=None):
     # print('MessageName:',event.MessageName)  #事件名称
     # print('Message:',event.Message)          #windows消息常量
     # print('Time:',event.Time)                #事件发生的时间戳
@@ -66,6 +158,10 @@ def get_mouse_event(event):
     mouse_move_interval_ms = globalv.mouse_interval_ms or 999999
 
     if action_type == 'mouse move' and delay < mouse_move_interval_ms:
+        return True
+
+    if globalv.background_mode:
+        _emit_background_mouse(action_type, delay, hwnd, screen if screen is not None else pos)
         return True
 
     if globalv.latest_time < 0:
@@ -117,6 +213,9 @@ def get_keyboard_event(event):
     key_info = (event.KeyID, event.Key, event.Extended)
 
     delay = globalv.current_ts() - globalv.latest_time
+    if globalv.background_mode:
+        _emit_background_key(event, action_type, delay)
+        return True
     if globalv.latest_time < 0:
         delay = 0
     globalv.latest_time = globalv.current_ts()
@@ -138,7 +237,7 @@ def mouse_handler(msg, x, y, data, flags, time, hwnd, window_name):
             name = name + (' up' if data > 0 else ' down')
         elif name in ['mouse x down', 'mouse x up']:
             name = name.replace('x', datadic[data])
-        get_mouse_event(MyMouseEvent(name))
+        get_mouse_event(MyMouseEvent(name), hwnd=hwnd, screen=(x, y))
     except KeyError as e:
         logger.debug('Unknown mouse event, keyid {0}'.format(e))
     finally:

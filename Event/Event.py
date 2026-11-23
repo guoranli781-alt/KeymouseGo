@@ -1,13 +1,19 @@
 from abc import ABCMeta, abstractmethod
 from typing import Dict, Any
 
+from Util.WindowBind import load_event_fields
+
 
 class Event(metaclass=ABCMeta):
     # 传入字典进行初始化
     def __init__(self, content: Dict[str, Any]):
-        """Default param: delay, event_type, message, action"""
-        for key in ['delay', 'event_type', 'action_type', 'action']:
-            setattr(self, key, content[key])
+        """Default param: delay, event_type, action_type, action.
+
+        Optional background-replay fields are stored only when present:
+        replay, coord, child, dpi, target, char.
+        """
+        for key, value in load_event_fields(content).items():
+            setattr(self, key, value)
 
     def __str__(self):
         if self.event_type == 'EK':
