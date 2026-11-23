@@ -4,6 +4,7 @@ import re
 import pyautogui
 from Event.Event import Event
 from loguru import logger
+from Util.WindowBind import BackgroundAbort, abort_for_route, dispatch_route, event_is_background
 
 SW, SH = pyautogui.size()
 
@@ -27,6 +28,11 @@ class UniversalEvent(Event):
 
     def execute(self, thd=None):
         self.sleep(thd)
+        route = dispatch_route(
+            event_is_background(self),
+            getattr(thd, 'background_session', None) is not None)
+        if route != 'global':
+            raise BackgroundAbort(abort_for_route(route))
 
         if self.event_type == 'EM':
             x, y = self.action

@@ -12,6 +12,7 @@ from loguru import logger
 
 from Plugin.Manager import PluginManager
 from Util.RunScriptClass import RunScriptCMDClass, StopFlag
+from Util.WindowBind import cli_window_spec
 
 
 def to_abs_path(*args):
@@ -45,9 +46,10 @@ def main():
 
 
 @logger.catch
-def single_run(script_path, run_times):
+def single_run(script_path, run_times, background=False, window_spec=None):
     flag = StopFlag(False)
-    thread = RunScriptCMDClass(script_path, run_times, flag)
+    thread = RunScriptCMDClass(script_path, run_times, flag,
+                               background=background, window_spec=window_spec)
 
     stop_name = 'f9'
 
@@ -86,10 +88,25 @@ if __name__ == '__main__':
                             type=int,
                             default=1
                             )
+        parser.add_argument('--background',
+                            action='store_true',
+                            help='Replay a background script with window messages'
+                            )
+        parser.add_argument('--title',
+                            default='',
+                            help='Target window title for background replay'
+                            )
+        parser.add_argument('--class-name',
+                            dest='class_name',
+                            default='',
+                            help='Target window class for background replay'
+                            )
         args = vars(parser.parse_args())
         logger.debug(args)
         single_run(args['scripts'],
-                   run_times=args['runtimes']
+                   run_times=args['runtimes'],
+                   background=args['background'],
+                   window_spec=cli_window_spec(args['title'], args['class_name'])
                    )
     else:
         main()
