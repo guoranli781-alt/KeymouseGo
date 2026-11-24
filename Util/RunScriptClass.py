@@ -17,6 +17,11 @@ mutex = QMutex()
 cond = QWaitCondition()
 
 
+def _remember_abort(runner, exc):
+    runner._abort_reason = exc.reason
+    runner._abort_status = getattr(exc, 'status', None)
+
+
 class RunScriptMeta:
     def pause(self):
         mutex.lock()
@@ -58,6 +63,7 @@ class RunScriptClass(QThread, RunScriptMeta):
         self.statusSignal.connect(frame.handle_runscript_status)
         self.playtuneSignal.connect(frame.playtune)
         self._abort_reason = None
+        self._abort_status = None
         self.background_session = None
         self.background_requested = bool(getattr(frame, 'background_mode', False))
         self.background_spec = None
@@ -98,7 +104,7 @@ class RunScriptClass(QThread, RunScriptMeta):
             self.run_script_from_path(self.script_path)
         except BackgroundAbort as exc:
             self.logSignal.emit(exc.reason)
-            self.tnumrdSignal.emit('stopped')
+            self.tnumrdSignal.emit(exc.status or 'stopped')
             logger.info(exc.reason)
         except Exception as e:
             logger.error(e)
@@ -134,12 +140,13 @@ class RunScriptClass(QThread, RunScriptMeta):
                 self.tnumrdSignal.emit('stopped')
                 return
             self._abort_reason = None
+            self._abort_status = None
             try:
                 prepare_run(self, head_object, self.background_requested,
                             self.background_spec, lambda: self.state == State.IDLE)
             except BackgroundAbort as exc:
                 self.logSignal.emit(exc.reason)
-                self.tnumrdSignal.emit('stopped')
+                self.tnumrdSignal.emit(exc.status or 'stopped')
                 logger.info(exc.reason)
                 return
 
@@ -155,7 +162,7 @@ class RunScriptClass(QThread, RunScriptMeta):
                 nointerrupt = nointerrupt and self.run_script_from_objects(head_object)
                 if self._abort_reason:
                     self.logSignal.emit(self._abort_reason)
-                    self.tnumrdSignal.emit('stopped')
+                    self.tnumrdSignal.emit(self._abort_status or 'stopped')
                     logger.info(self._abort_reason)
                     return
                 j += 1
@@ -209,7 +216,7 @@ class RunScriptClass(QThread, RunScriptMeta):
             try:
                 event.execute(self)
             except BackgroundAbort as exc:
-                self._abort_reason = exc.reason
+                _remember_abort(self, exc)
                 return None
         elif object_type == 'sequence':
             self.run_script_from_objects(json_object.content['events'], json_object.content['attach'])
@@ -249,6 +256,7 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
         self.background_requested = bool(background)
         self.background_spec = window_spec
         self._abort_reason = None
+        self._abort_status = None
         self.background_session = None
 
     def sleep(self, msecs: int):
@@ -278,6 +286,7 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
                 self.flag.value = True
                 break
             self._abort_reason = None
+            self._abort_status = None
             try:
                 prepare_run(self, head_object, self.background_requested,
                             self.background_spec, lambda: self.flag.value)
@@ -326,7 +335,7 @@ class RunScriptCMDClass(QThread, RunScriptMeta):
             try:
                 event.execute(self)
             except BackgroundAbort as exc:
-                self._abort_reason = exc.reason
+                _remember_abort(self, exc)
                 return None
         elif object_type == 'sequence':
             self.run_script_from_objects(json_object.content['events'], json_object.content['attach'])
