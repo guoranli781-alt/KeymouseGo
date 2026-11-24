@@ -63,14 +63,39 @@ MOUSE_BUTTONS = {
     'mouse middle down': (WM_MBUTTONDOWN, MK_MBUTTON),
     'mouse middle up': (WM_MBUTTONUP, 0),
 }
+CLICK_MOVE_DELAY_MS = 10
+# 方向键、Insert/Delete/Home/End、PageUp/PageDown、右 Ctrl、右 Alt。
+# 小键盘 Enter 与主键 Enter 的虚拟键相同，只看录制到的扩展标志。
+EXTENDED_VKS = frozenset({
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+    0x2D, 0x2E, 0xA3, 0xA5,
+})
+MESSAGE_NAMES = {
+    WM_KEYDOWN: 'WM_KEYDOWN',
+    WM_KEYUP: 'WM_KEYUP',
+    WM_CHAR: 'WM_CHAR',
+    WM_MOUSEMOVE: 'WM_MOUSEMOVE',
+    WM_LBUTTONDOWN: 'WM_LBUTTONDOWN',
+    WM_LBUTTONUP: 'WM_LBUTTONUP',
+    WM_RBUTTONDOWN: 'WM_RBUTTONDOWN',
+    WM_RBUTTONUP: 'WM_RBUTTONUP',
+    WM_MBUTTONDOWN: 'WM_MBUTTONDOWN',
+    WM_MBUTTONUP: 'WM_MBUTTONUP',
+    WM_MOUSEWHEEL: 'WM_MOUSEWHEEL',
+}
+_ERROR_HINTS = {
+    5: '拒绝访问，常见于完整性级别或 UIPI 拦截',
+    1400: '窗口句柄无效',
+}
 SUPPORTED_MOUSE = set(MOUSE_BUTTONS) | {'mouse move', 'mouse wheel up', 'mouse wheel down'}
 SUPPORTED_KEYS = {'key down', 'key up'}
 
 
 class BackgroundAbort(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, status=None):
         super().__init__(reason)
         self.reason = reason
+        self.status = status
 
 
 class WindowInfo(object):
@@ -246,7 +271,10 @@ def capture_mouse(api, binding, hwnd, screen_x, screen_y, action_type):
     if action_type not in SUPPORTED_MOUSE:
         return CaptureResult(False, REASON_UNSUPPORTED)
     if not hwnd:
-        return CaptureResult(False, REASON_NO_HIT)
+        hit_x, hit_y = api.screen_to_client(binding.hwnd, screen_x, screen_y)
+        if not _point_in_client(api.client_rect(binding.hwnd), int(hit_x), int(hit_y)):
+            return CaptureResult(False, REASON_NO_HIT)
+        hwnd = int(binding.hwnd)
     root = int(api.root(hwnd) or 0)
     if root != int(binding.hwnd):
         return CaptureResult(False, REASON_OUTSIDE)
@@ -261,7 +289,9 @@ def capture_mouse(api, binding, hwnd, screen_x, screen_y, action_type):
     if child['level'] == 'child':
         matches = api.find_children(root, child['class_name'], child['ctrl_id'])
         if len(matches) != 1:
-            return CaptureResult(False, REASON_AMBIGUOUS_CHILD)
+            # 游戏窗口经常没有可区分的标准子控件。改记到绑定窗口，并把坐标换到该窗口的客户区。
+            client_x, client_y = map_client_point(api, hwnd, root, client_x, client_y)
+            child = _child_fields(api, root, root)
     fields = {
         'replay': 'background',
         'coord': 'client',
@@ -281,7 +311,7 @@ def capture_key(api, binding, foreground_hwnd, focus_hwnd, action_type, key_acti
     if not foreground_hwnd or int(api.root(foreground_hwnd) or 0) != int(binding.hwnd):
         return CaptureResult(False, REASON_NOT_FOREGROUND)
     if not focus_hwnd:
-        return CaptureResult(False, REASON_NO_FOCUS)
+        focus_hwnd = int(binding.hwnd)
     focus_root = int(api.root(focus_hwnd) or 0)
     if focus_root != int(binding.hwnd):
         return CaptureResult(False, REASON_FOCUS_OUTSIDE)
@@ -289,7 +319,7 @@ def capture_key(api, binding, foreground_hwnd, focus_hwnd, action_type, key_acti
     if child['level'] == 'child':
         matches = api.find_children(focus_root, child['class_name'], child['ctrl_id'])
         if len(matches) != 1:
-            return CaptureResult(False, REASON_AMBIGUOUS_CHILD)
+            child = _child_fields(api, binding.hwnd, binding.hwnd)
     vk, name, extended = key_action
     if vk is None:
         return CaptureResult(False, REASON_UNSUPPORTED)
@@ -369,20 +399,63 @@ def _client_point(action):
     return int(x), int(y)
 
 
-def _key_lparam(extended, is_up):
+def _key_lparam(vk, extended, is_up, scan):
+    """repeat=1，扫描码在 16-23 位，扩展键置 bit 24，抬起再置 bit 30 和 bit 31。"""
     value = 1
-    if extended:
+    value |= (int(scan or 0) & 0xFF) << 16
+    if extended or int(vk) in EXTENDED_VKS:
         value |= 1 << 24
     if is_up:
         value |= (1 << 30) | (1 << 31)
     return value
 
 
+def map_client_point(api, source_hwnd, dest_hwnd, x, y):
+    """把客户区坐标从 source_hwnd 换到 dest_hwnd。同一个窗口则原样返回。"""
+    if not source_hwnd or int(source_hwnd) == int(dest_hwnd):
+        return int(x), int(y)
+    screen_x, screen_y = api.client_to_screen(int(source_hwnd), int(x), int(y))
+    dest_x, dest_y = api.screen_to_client(int(dest_hwnd), int(screen_x), int(screen_y))
+    return int(dest_x), int(dest_y)
+
+
+def format_delivery_failure(action, hwnd, class_name, msg, level, failure):
+    msg_name = MESSAGE_NAMES.get(int(msg), '0x{0:04X}'.format(int(msg) & 0xFFFF))
+    hwnd_text = '0x{0:X}'.format(int(hwnd) & ((1 << 64) - 1))
+    class_text = class_name or '?'
+    level_text = level or '?'
+    action_text = action or msg_name
+    code = None
+    text = ''
+    if failure is not None:
+        code = getattr(failure, 'winerror', None)
+        if isinstance(code, bool) or not isinstance(code, int):
+            code = None
+        text = ' '.join(str(getattr(failure, 'message', '') or '').split())
+    if code is None:
+        code_text = '无'
+        detail = text or '没有 Windows 错误码'
+    else:
+        code_text = str(code)
+        detail = text or '没有错误说明'
+        hint = _ERROR_HINTS.get(code, '')
+        if hint and hint not in detail:
+            detail = '{0}；{1}'.format(detail, hint)
+    reason = (
+        ABORT_POST
+        + '。系统拒绝投递 {0}（{1}），目标 HWND={2} class={3} level={4}，Windows 错误 {5}：{6}。'
+        '这是操作系统没有把消息放入目标窗口的队列，不是目标程序忽略了已经投递成功的消息。'
+    ).format(msg_name, action_text, hwnd_text, class_text, level_text, code_text, detail)
+    status = 'stopped: {0} {1}'.format(msg_name, code_text)
+    return reason, status
+
+
 class BackgroundSession(object):
-    def __init__(self, api, binding, stop_check=None):
+    def __init__(self, api, binding, stop_check=None, sleeper=None):
         self.api = api
         self.binding = binding
         self.stop_check = stop_check
+        self.sleeper = sleeper
 
     def play(self, event):
         check_stop(self.stop_check)
@@ -411,25 +484,25 @@ class BackgroundSession(object):
             raise BackgroundAbort(ABORT_MINIMIZED)
         return hwnd
 
-    def _destination(self, child):
+    def _resolve_receiver(self, child):
+        """返回 (hwnd, level)。没有唯一子控件时回退到绑定的顶层窗口，不中止脚本。"""
         root = self._lock_root()
         if not isinstance(child, dict):
-            raise BackgroundAbort(ABORT_NO_CHILD)
+            return root, 'root'
         level = child.get('level')
         class_name = child.get('class_name') or ''
         ctrl_id = int(child.get('ctrl_id') or 0)
         if level == 'root':
-            if not _same_class(self.api.class_name(root), class_name):
+            if class_name and not _same_class(self.api.class_name(root), class_name):
                 raise BackgroundAbort(ABORT_STALE)
-            return root
+            return root, 'root'
         if level != 'child':
-            raise BackgroundAbort(ABORT_NO_CHILD)
+            return root, 'root'
         matches = self.api.find_children(root, class_name, ctrl_id)
-        if len(matches) == 0:
-            raise BackgroundAbort(ABORT_CHILD_MISSING)
-        if len(matches) > 1:
-            raise BackgroundAbort(ABORT_CHILD_AMBIGUOUS)
-        return int(matches[0])
+        if len(matches) == 1:
+            return int(matches[0]), 'child'
+        # 子控件不在或不唯一。新录下来的坐标已经是绑定窗口的客户区坐标。
+        return root, 'root'
 
     def _check_dpi(self, hwnd, recorded):
         current = int(self.api.dpi(hwnd) or 0)
@@ -439,33 +512,70 @@ class BackgroundSession(object):
         if bool(recorded) != bool(current):
             raise BackgroundAbort(ABORT_DPI_UNKNOWN)
 
-    def _post(self, hwnd, msg, wparam, lparam):
+    def _scan(self, vk):
+        fn = getattr(self.api, 'scan_code', None)
+        if not callable(fn):
+            return 0
+        try:
+            return int(fn(int(vk)) or 0) & 0xFF
+        except Exception:
+            return 0
+
+    def _wait_click_gap(self):
         check_stop(self.stop_check)
-        if not self.api.post(int(hwnd), int(msg), int(wparam), int(lparam)):
-            raise BackgroundAbort(ABORT_POST)
+        if self.sleeper is not None:
+            self.sleeper(CLICK_MOVE_DELAY_MS)
+        else:
+            import time
+            time.sleep(CLICK_MOVE_DELAY_MS / 1000.0)
+        check_stop(self.stop_check)
+
+    def _post(self, hwnd, msg, wparam, lparam, action, level):
+        check_stop(self.stop_check)
+        delivered = self.api.post(int(hwnd), int(msg), int(wparam), int(lparam))
+        if delivered:
+            return
+        failure = getattr(self.api, 'last_post_failure', None)
+        try:
+            class_name = self.api.class_name(hwnd) or ''
+        except Exception:
+            class_name = ''
+        reason, status = format_delivery_failure(action, hwnd, class_name, msg, level, failure)
+        raise BackgroundAbort(reason, status)
+
+    def _receiver_point(self, event, x, y):
+        dest, level = self._resolve_receiver(getattr(event, 'child', None))
+        return dest, int(x), int(y), level
 
     def _play_mouse(self, event, action_type):
         if action_type not in SUPPORTED_MOUSE:
             raise BackgroundAbort(ABORT_UNSUPPORTED)
-        dest = self._destination(getattr(event, 'child', None))
-        self._check_dpi(dest, getattr(event, 'dpi', 0))
         x, y = _client_point(getattr(event, 'action', None))
+        dest, x, y, level = self._receiver_point(event, x, y)
+        self._check_dpi(dest, getattr(event, 'dpi', 0))
         if action_type == 'mouse move':
-            self._post(dest, WM_MOUSEMOVE, 0, pack_xy(x, y))
+            self._post(dest, WM_MOUSEMOVE, 0, pack_xy(x, y), action_type, level)
             return
         if action_type in ('mouse wheel up', 'mouse wheel down'):
             delta = WHEEL_DELTA if action_type == 'mouse wheel up' else -WHEEL_DELTA
             screen_x, screen_y = self.api.client_to_screen(dest, x, y)
             wparam = (delta & 0xFFFF) << 16
-            self._post(dest, WM_MOUSEWHEEL, wparam, pack_xy(screen_x, screen_y))
+            self._post(dest, WM_MOUSEWHEEL, wparam, pack_xy(screen_x, screen_y), action_type, level)
             return
         message, wparam = MOUSE_BUTTONS[action_type]
-        self._post(dest, message, wparam, pack_xy(x, y))
+        point = pack_xy(x, y)
+        if action_type.endswith(' down'):
+            # 先移到客户区坐标，再按下。抬起不走这里。
+            self._post(dest, WM_MOUSEMOVE, 0, point, action_type, level)
+            self._wait_click_gap()
+        else:
+            wparam = 0
+        self._post(dest, message, wparam, point, action_type, level)
 
     def _play_key(self, event, action_type):
         if action_type not in SUPPORTED_KEYS:
             raise BackgroundAbort(ABORT_UNSUPPORTED)
-        dest = self._destination(getattr(event, 'child', None))
+        dest, level = self._resolve_receiver(getattr(event, 'child', None))
         self._check_dpi(dest, getattr(event, 'dpi', 0))
         action = getattr(event, 'action', None)
         if not isinstance(action, (list, tuple)) or len(action) < 1 or action[0] is None:
@@ -473,20 +583,21 @@ class BackgroundSession(object):
         vk = int(action[0])
         extended = int(action[2]) if len(action) > 2 and action[2] else 0
         is_up = action_type == 'key up'
-        self._post(dest, WM_KEYUP if is_up else WM_KEYDOWN, vk, _key_lparam(extended, is_up))
+        lparam = _key_lparam(vk, extended, is_up, self._scan(vk))
+        self._post(dest, WM_KEYUP if is_up else WM_KEYDOWN, vk, lparam, action_type, level)
         char = getattr(event, 'char', '') or ''
         if action_type == 'key down' and char:
             for unit in utf16_units(char):
-                self._post(dest, WM_CHAR, unit, 1)
+                self._post(dest, WM_CHAR, unit, 1, action_type, level)
 
     def _play_text(self, event):
-        dest = self._destination(getattr(event, 'child', None))
+        dest, level = self._resolve_receiver(getattr(event, 'child', None))
         self._check_dpi(dest, getattr(event, 'dpi', 0))
         text = getattr(event, 'action', None)
         if not isinstance(text, str):
             raise BackgroundAbort(ABORT_UNSUPPORTED)
         for unit in utf16_units(text):
-            self._post(dest, WM_CHAR, unit, 1)
+            self._post(dest, WM_CHAR, unit, 1, 'input', level)
 
 
 def prepare_run(runner, head, requested_background, spec, stop_check, api_factory=None):
@@ -504,7 +615,10 @@ def prepare_run(runner, head, requested_background, spec, stop_check, api_factor
     info = resolve_target(api, target)
     if api.is_minimized(info.hwnd):
         raise BackgroundAbort(ABORT_MINIMIZED)
-    runner.background_session = BackgroundSession(api, info, stop_check)
+    sleeper = getattr(runner, 'sleep', None)
+    if not callable(sleeper):
+        sleeper = None
+    runner.background_session = BackgroundSession(api, info, stop_check, sleeper)
     return 'background'
 
 

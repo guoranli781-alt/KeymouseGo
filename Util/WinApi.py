@@ -11,6 +11,84 @@ from ctypes import wintypes
 from Util.WindowBind import WindowInfo
 
 GA_ROOT = 2
+MAPVK_VK_TO_VSC = 0
+
+
+class DeliveryError(object):
+    """操作系统拒绝把消息放入队列。winerror 来自 API 包装当场记下的错误，不是事后再读的 GetLastError。"""
+
+    def __init__(self, winerror, message, funcname='PostMessage'):
+        self.winerror = winerror
+        self.message = message or ''
+        self.funcname = funcname or 'PostMessage'
+
+
+def to_wparam(value):
+    """WPARAM 按无符号 32 位保留。滚轮高字为负数时高位必须还在。"""
+    return int(value) & 0xFFFFFFFF
+
+
+def to_lparam(value):
+    """压成 Win32 MAKELPARAM / 键 lParam 的有符号 32 位。
+
+    高位为 1 时用负数交给 pywin32，64 位 LPARAM 才会按符号扩展，
+    低 32 位与 GET_X_LPARAM / GET_Y_LPARAM 一致。
+    """
+    value = int(value) & 0xFFFFFFFF
+    if value >= 0x80000000:
+        return value - 0x100000000
+    return value
+
+
+def _is_pywin32_api_error(exc):
+    return (
+        type(exc).__name__ == 'error'
+        and hasattr(exc, 'winerror')
+        and hasattr(exc, 'strerror')
+    )
+
+
+def classify_post_outcome(result, api_error=None, captured_last_error=None):
+    """区分「系统已接受消息」和「系统拒绝投递」。
+
+    pywin32 的 win32gui.PostMessage / win32api.PostMessage 是 BOOLAPI：
+    成功返回 None，失败抛 pywintypes.error，错误码在异常对象里。
+    成功时不能再读 GetLastError，那个值是过期的。
+
+    ctypes 的 PostMessageW 在设置了指针宽度参数和 use_last_error 之后：
+    非 0 为成功；0 为失败，错误码只能用调用当时记下的 captured_last_error。
+    """
+    if api_error is not None:
+        winerror = getattr(api_error, 'winerror', None)
+        if isinstance(winerror, bool) or not isinstance(winerror, int):
+            winerror = None
+        message = getattr(api_error, 'strerror', None) or str(api_error)
+        funcname = getattr(api_error, 'funcname', None) or 'PostMessage'
+        return DeliveryError(winerror, ' '.join(str(message).split()), funcname)
+    if result is None or result is True:
+        return None
+    if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+        return None
+    code = None
+    if captured_last_error is not None and not isinstance(captured_last_error, bool):
+        try:
+            code = int(captured_last_error)
+        except (TypeError, ValueError):
+            code = None
+    text = '' if code is not None else 'PostMessage 返回 0'
+    return DeliveryError(code, text, 'PostMessage')
+
+
+def apply_postmessage_prototype(post_message):
+    """HWND / WPARAM / LPARAM 都是指针宽度。Windows x64 上 c_long 只有 32 位，不能用来传句柄。"""
+    post_message.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+    )
+    post_message.restype = ctypes.c_int
+    return post_message
 
 
 class _RECT(ctypes.Structure):
@@ -44,6 +122,7 @@ class WindowsWinApi(object):
         self.win32process = win32process
         self.user32 = ctypes.windll.user32
         self._my_pid = os.getpid()
+        self.last_post_failure = None
 
     def is_valid(self, hwnd):
         try:
@@ -164,11 +243,40 @@ class WindowsWinApi(object):
             return []
         return found
 
-    def post(self, hwnd, msg, wparam, lparam):
+    def scan_code(self, vk):
+        """MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) 的低 8 位。取不到时返回 0，不中断回放。"""
         try:
-            return bool(self.win32gui.PostMessage(int(hwnd), int(msg), int(wparam), int(lparam)))
+            fn = self.user32.MapVirtualKeyW
+            fn.argtypes = [ctypes.c_uint, ctypes.c_uint]
+            fn.restype = ctypes.c_uint
+            return int(fn(int(vk) & 0xFFFFFFFF, MAPVK_VK_TO_VSC) or 0) & 0xFF
         except Exception:
+            return 0
+
+    def post(self, hwnd, msg, wparam, lparam):
+        """把一条消息放入目标队列。成功返回 True。
+
+        pywin32 成功时返回 None，不是 True。None 表示系统已经接受，
+        不能当成失败，也不能再用 GetLastError 去解释它。
+        游戏忽略已经入队的消息不会走到这里。
+        """
+        self.last_post_failure = None
+        try:
+            result = self.win32gui.PostMessage(
+                int(hwnd), int(msg), to_wparam(wparam), to_lparam(lparam))
+        except Exception as exc:
+            if _is_pywin32_api_error(exc):
+                failure = classify_post_outcome(None, api_error=exc)
+            else:
+                failure = DeliveryError(
+                    None,
+                    '{0}: {1}'.format(type(exc).__name__, exc),
+                    'PostMessage')
+            self.last_post_failure = failure
             return False
+        failure = classify_post_outcome(result)
+        self.last_post_failure = failure
+        return failure is None
 
     def foreground(self):
         try:
